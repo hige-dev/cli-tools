@@ -16,6 +16,7 @@ BIN_DIR="$HOME/.local/bin"
 declare -A TOOLS=(
     [nippou]="nippou/nippou.sh"
     [ecs_exec]="ecs-exec/ecs-exec.sh"
+    [db_connect]="db-connect/db-connect.sh"
 )
 
 install_links() {
