@@ -1,0 +1,33 @@
+{
+  "profiles": {
+    "dev": {
+      "aws_profile": "dev",
+      "bastion_instance_id": "i-xxxxxxxxxxxxxxxxx",
+      "databases": {
+        "main": {
+          "endpoint": "main.cluster-xxxx.ap-northeast-1.rds.example",
+          "engine": "mysql",
+          "local_port": 13306
+        },
+        "analytics": {
+          "endpoint": "analytics.cluster-xxxx.ap-northeast-1.rds.example",
+          "engine": "mysql",
+          "local_port": 13307
+        }
+      },
+      "description": "開発環境"
+    },
+    "stg": {
+      "aws_profile": "stg",
+      "bastion_instance_id": "i-yyyyyyyyyyyyyyyyy",
+      "databases": {
+        "main": {
+          "endpoint": "main.cluster-yyyy.ap-northeast-1.rds.example",
+          "engine": "postgresql",
+          "local_port": 15432
+        }
+      },
+      "description": "ステージング環境"
+    }
+  }
+}
