@@ -17,6 +17,7 @@ declare -A TOOLS=(
     [nippou]="nippou/nippou.sh"
     [ecs_exec]="ecs-exec/ecs-exec.sh"
     [db_connect]="db-connect/db-connect.sh"
+    [devops_agent]="devops-agent/devops-agent.sh"
 )
 
 install_links() {
