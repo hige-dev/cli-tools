@@ -40,14 +40,12 @@ vi config.json  # 環境に合わせて編集
       "bastion_instance_id": "i-xxxxxxxxxxxxxxxxx",
       "databases": {
         "main": {
-          "endpoint": "main.cluster-xxxx.ap-northeast-1.rds.example",
-          "engine": "mysql",
-          "local_port": 13306
+          "endpoint": "main.cluster-xxxx.ap-northeast-1.rds.example:5432",
+          "local_port": 15432
         },
-        "analytics": {
-          "endpoint": "analytics.cluster-xxxx.ap-northeast-1.rds.example",
-          "engine": "mysql",
-          "local_port": 13307
+        "sub": {
+          "endpoint": "sub.cluster-xxxx.ap-northeast-1.rds.example:5432",
+          "local_port": 15433
         }
       },
       "description": "開発環境"
@@ -71,8 +69,7 @@ vi config.json  # 環境に合わせて編集
 
 | フィールド | 必須 | 説明 |
 |---|---|---|
-| `endpoint` | ○ | RDS / Aurora エンドポイント |
-| `engine` | ○ | DB エンジン (`mysql` / `aurora-mysql` /<br> `postgresql` / `aurora-postgresql`) |
+| `endpoint` | ○ | RDS エンドポイント（`host:port` 形式） |
 | `local_port` | ○ | ローカルポート番号（DB ごとに固定） |
 
 ## 前提条件

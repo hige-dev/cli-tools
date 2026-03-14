@@ -9,7 +9,7 @@
 #   ./db-connect.sh [config-profile]
 #
 # 設定ファイル:
-#   ~/.config/db-connect/config.json
+#   <script-dir>/config.json
 #
 # 必要なもの:
 #   - AWS CLI v2 (session-manager-plugin 導入済み)
@@ -85,14 +85,12 @@ init_config() {
       "bastion_instance_id": "i-xxxxxxxxxxxxxxxxx",
       "databases": {
         "main": {
-          "endpoint": "main.cluster-xxxx.ap-northeast-1.rds.example",
-          "engine": "mysql",
-          "local_port": 13306
+          "endpoint": "main.cluster-xxxx.ap-northeast-1.rds.example:5432",
+          "local_port": 15432
         },
-        "analytics": {
-          "endpoint": "analytics.cluster-xxxx.ap-northeast-1.rds.example",
-          "engine": "mysql",
-          "local_port": 13307
+        "sub": {
+          "endpoint": "sub.cluster-xxxx.ap-northeast-1.rds.example:5432",
+          "local_port": 15433
         }
       },
       "description": "開発環境"
@@ -102,9 +100,8 @@ init_config() {
       "bastion_instance_id": "i-yyyyyyyyyyyyyyyyy",
       "databases": {
         "main": {
-          "endpoint": "main.cluster-yyyy.ap-northeast-1.rds.example",
-          "engine": "postgresql",
-          "local_port": 15432
+          "endpoint": "main.cluster-yyyy.ap-northeast-1.rds.example:5432",
+          "local_port": 25432
         }
       },
       "description": "ステージング環境"
@@ -264,7 +261,7 @@ main() {
             --target "$bastion"
     else
         # --- DB 選択 ---
-        local db_name rds_endpoint engine local_port remote_port
+        local db_name rds_endpoint local_port remote_port
         local db_names
         mapfile -t db_names < <(
             jq -r ".profiles[\"${config_profile}\"].databases // {} | keys[]" "$CONFIG_FILE"
@@ -276,11 +273,10 @@ main() {
 
         local db_display=()
         for db in "${db_names[@]}"; do
-            local ep eng lp
+            local ep lp
             ep=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db}\"].endpoint" "$CONFIG_FILE")
-            eng=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db}\"].engine" "$CONFIG_FILE")
             lp=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db}\"].local_port" "$CONFIG_FILE")
-            db_display+=("${db}  ${ep} (${eng}, port:${lp})")
+            db_display+=("${db}  ${ep} (local:${lp})")
         done
 
         local selected_db
@@ -288,24 +284,14 @@ main() {
             || die "データベースが選択されませんでした"
         db_name=$(echo "$selected_db" | awk '{print $1}')
 
-        rds_endpoint=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db_name}\"].endpoint" "$CONFIG_FILE")
-        engine=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db_name}\"].engine" "$CONFIG_FILE")
+        local endpoint_raw
+        endpoint_raw=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db_name}\"].endpoint" "$CONFIG_FILE")
+        rds_endpoint="${endpoint_raw%:*}"
+        remote_port="${endpoint_raw##*:}"
         local_port=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db_name}\"].local_port" "$CONFIG_FILE")
 
-        # エンジンからリモートポートを決定
-        case "${engine}" in
-            mysql|aurora-mysql)    remote_port=3306 ;;
-            postgres*|aurora-pos*) remote_port=5432 ;;
-            *)
-                echo "リモートポートを入力してください (MySQL=3306, PostgreSQL=5432):" >&2
-                read -rp "> " remote_port
-                ;;
-        esac
-
         echo "-- DB: ${db_name}"
-        echo "-- RDS: ${rds_endpoint}"
-        echo "-- エンジン: ${engine}"
-        echo "-- リモートポート: ${remote_port}"
+        echo "-- RDS: ${rds_endpoint}:${remote_port}"
         echo "-- ローカルポート: ${local_port}"
         echo ""
         echo "=> ポートフォワードを開始します"
@@ -313,11 +299,11 @@ main() {
         echo ""
         echo "   接続例:"
         case "${remote_port}" in
-            3306)
-                echo "     mysql -h 127.0.0.1 -P ${local_port} -u <USER> -p <DB_NAME>"
-                ;;
             5432)
                 echo "     psql -h 127.0.0.1 -p ${local_port} -U <USER> <DB_NAME>"
+                ;;
+            3306)
+                echo "     mysql -h 127.0.0.1 -P ${local_port} -u <USER> -p <DB_NAME>"
                 ;;
             *)
                 echo "     <client> -h 127.0.0.1 -p ${local_port}"
