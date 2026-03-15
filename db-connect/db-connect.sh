@@ -9,7 +9,7 @@
 #   ./db-connect.sh [config-profile]
 #
 # 設定ファイル:
-#   ~/.config/db-connect/config.json
+#   <script-dir>/config.json
 #
 # 必要なもの:
 #   - AWS CLI v2 (session-manager-plugin 導入済み)
@@ -19,8 +19,8 @@
 
 set -euo pipefail
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/db-connect"
-CONFIG_FILE="${CONFIG_DIR}/config.json"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.json"
 
 # ---------------------------------------------------------------------------
 # ユーティリティ
@@ -77,24 +77,33 @@ init_config() {
         if [[ "$answer" =~ ^[Nn] ]]; then
             die "設定ファイルを作成してから再実行してください"
         fi
-        mkdir -p "$CONFIG_DIR"
         cat > "$CONFIG_FILE" << 'SAMPLE'
 {
   "profiles": {
     "dev": {
       "aws_profile": "dev",
       "bastion_instance_id": "i-xxxxxxxxxxxxxxxxx",
-      "default_rds": "mydb.cluster-xxxx.ap-northeast-1.rds.amazonaws.com",
-      "default_engine": "mysql",
-      "default_local_port": 13306,
+      "databases": {
+        "main": {
+          "endpoint": "main.cluster-xxxx.ap-northeast-1.rds.example:5432",
+          "local_port": 15432
+        },
+        "sub": {
+          "endpoint": "sub.cluster-xxxx.ap-northeast-1.rds.example:5432",
+          "local_port": 15433
+        }
+      },
       "description": "開発環境"
     },
     "stg": {
       "aws_profile": "stg",
       "bastion_instance_id": "i-yyyyyyyyyyyyyyyyy",
-      "default_rds": "",
-      "default_engine": "postgresql",
-      "default_local_port": 15432,
+      "databases": {
+        "main": {
+          "endpoint": "main.cluster-yyyy.ap-northeast-1.rds.example:5432",
+          "local_port": 25432
+        }
+      },
       "description": "ステージング環境"
     }
   }
@@ -167,101 +176,6 @@ select_bastion() {
     echo "$selected" | awk '{print $1}'
 }
 
-# ---------------------------------------------------------------------------
-# RDS 選択
-# ---------------------------------------------------------------------------
-
-select_rds() {
-    local default_rds="$1" engine="$2"
-
-    if [[ -n "$default_rds" ]]; then
-        echo "RDS エンドポイント: ${default_rds} (設定ファイルのデフォルト)" >&2
-        echo "このまま使用しますか？ [Y/n]" >&2
-        local answer
-        read -r answer
-        if [[ ! "$answer" =~ ^[Nn] ]]; then
-            echo "$default_rds"
-            return
-        fi
-    fi
-
-    echo "RDS インスタンスを取得中..." >&2
-    local rds_json
-    rds_json=$(aws_cmd rds describe-db-instances 2>/dev/null) \
-        || die "RDS インスタンスの取得に失敗しました"
-
-    local items
-    mapfile -t items < <(
-        echo "$rds_json" | jq -r '
-            .DBInstances[] |
-            (.Endpoint.Address // empty) + "\t" +
-            .DBInstanceIdentifier + "\t" +
-            .Engine + "\t" +
-            (.Endpoint.Port | tostring)
-        '
-    )
-
-    # Aurora クラスタエンドポイントも取得
-    local cluster_json
-    cluster_json=$(aws_cmd rds describe-db-clusters 2>/dev/null) || true
-    if [[ -n "$cluster_json" ]]; then
-        local cluster_items
-        mapfile -t cluster_items < <(
-            echo "$cluster_json" | jq -r '
-                .DBClusters[] |
-                (.Endpoint // empty) + "\t" +
-                .DBClusterIdentifier + " (writer)\t" +
-                .Engine + "\t" +
-                (.Port | tostring)
-            ' 2>/dev/null
-        ) || true
-        items+=("${cluster_items[@]}")
-    fi
-
-    [[ ${#items[@]} -gt 0 ]] || die "RDS インスタンスが見つかりません"
-
-    local display=()
-    for item in "${items[@]}"; do
-        [[ -z "$item" ]] && continue
-        local endpoint ident eng port
-        endpoint=$(echo "$item" | cut -f1)
-        ident=$(echo "$item" | cut -f2)
-        eng=$(echo "$item" | cut -f3)
-        port=$(echo "$item" | cut -f4)
-        display+=("${endpoint}  [${ident}] (${eng}:${port})")
-    done
-
-    [[ ${#display[@]} -gt 0 ]] || die "RDS エンドポイントが見つかりません"
-
-    local selected
-    selected=$(pick_one "RDS" "${display[@]}") || die "RDS が選択されませんでした"
-    echo "$selected" | awk '{print $1}'
-}
-
-detect_engine_port() {
-    local rds_endpoint="$1"
-
-    local rds_json
-    rds_json=$(aws_cmd rds describe-db-instances 2>/dev/null) || true
-
-    local info
-    info=$(echo "$rds_json" | jq -r --arg ep "$rds_endpoint" '
-        .DBInstances[] | select(.Endpoint.Address == $ep) |
-        .Engine + "\t" + (.Endpoint.Port | tostring)
-    ' 2>/dev/null) || true
-
-    # クラスタエンドポイントの場合
-    if [[ -z "$info" ]]; then
-        local cluster_json
-        cluster_json=$(aws_cmd rds describe-db-clusters 2>/dev/null) || true
-        info=$(echo "$cluster_json" | jq -r --arg ep "$rds_endpoint" '
-            .DBClusters[] | select(.Endpoint == $ep) |
-            .Engine + "\t" + (.Port | tostring)
-        ' 2>/dev/null) || true
-    fi
-
-    echo "$info"
-}
 
 # ---------------------------------------------------------------------------
 # メイン
@@ -303,11 +217,8 @@ main() {
 
     # 設定値の読み込み
     AWS_PROFILE=$(get_config "$config_profile" "aws_profile")
-    local default_bastion default_rds default_engine default_local_port
+    local default_bastion
     default_bastion=$(get_config "$config_profile" "bastion_instance_id")
-    default_rds=$(get_config "$config_profile" "default_rds")
-    default_engine=$(get_config "$config_profile" "default_engine")
-    default_local_port=$(get_config "$config_profile" "default_local_port")
 
     echo "=== DB Connect ==="
     echo "-- プロファイル: ${config_profile}"
@@ -349,36 +260,38 @@ main() {
             ${AWS_PROFILE:+--profile "$AWS_PROFILE"} \
             --target "$bastion"
     else
-        # --- ポートフォワード ---
-        local rds_endpoint
-        rds_endpoint=$(select_rds "$default_rds" "$default_engine")
-        echo "-- RDS: ${rds_endpoint}"
+        # --- DB 選択 ---
+        local db_name rds_endpoint local_port remote_port
+        local db_names
+        mapfile -t db_names < <(
+            jq -r ".profiles[\"${config_profile}\"].databases // {} | keys[]" "$CONFIG_FILE"
+        )
 
-        # エンジン・ポート自動検出
-        local remote_port
-        local engine_info
-        engine_info=$(detect_engine_port "$rds_endpoint")
-
-        if [[ -n "$engine_info" ]]; then
-            local detected_engine detected_port
-            detected_engine=$(echo "$engine_info" | cut -f1)
-            detected_port=$(echo "$engine_info" | cut -f2)
-            remote_port="${detected_port}"
-            echo "-- エンジン: ${detected_engine} (自動検出)"
-        else
-            # 自動検出できない場合はデフォルトエンジンから推定
-            case "${default_engine}" in
-                mysql|aurora-mysql)    remote_port=3306 ;;
-                postgres*|aurora-pos*) remote_port=5432 ;;
-                *)
-                    echo "リモートポートを入力してください (MySQL=3306, PostgreSQL=5432):" >&2
-                    read -rp "> " remote_port
-                    ;;
-            esac
+        if [[ ${#db_names[@]} -eq 0 ]]; then
+            die "プロファイル '${config_profile}' に databases が定義されていません"
         fi
 
-        local local_port="${default_local_port:-${remote_port}}"
-        echo "-- リモートポート: ${remote_port}"
+        local db_display=()
+        for db in "${db_names[@]}"; do
+            local ep lp
+            ep=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db}\"].endpoint" "$CONFIG_FILE")
+            lp=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db}\"].local_port" "$CONFIG_FILE")
+            db_display+=("${db}  ${ep} (local:${lp})")
+        done
+
+        local selected_db
+        selected_db=$(pick_one "データベース" "${db_display[@]}") \
+            || die "データベースが選択されませんでした"
+        db_name=$(echo "$selected_db" | awk '{print $1}')
+
+        local endpoint_raw
+        endpoint_raw=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db_name}\"].endpoint" "$CONFIG_FILE")
+        rds_endpoint="${endpoint_raw%:*}"
+        remote_port="${endpoint_raw##*:}"
+        local_port=$(jq -r ".profiles[\"${config_profile}\"].databases[\"${db_name}\"].local_port" "$CONFIG_FILE")
+
+        echo "-- DB: ${db_name}"
+        echo "-- RDS: ${rds_endpoint}:${remote_port}"
         echo "-- ローカルポート: ${local_port}"
         echo ""
         echo "=> ポートフォワードを開始します"
@@ -386,11 +299,11 @@ main() {
         echo ""
         echo "   接続例:"
         case "${remote_port}" in
-            3306)
-                echo "     mysql -h 127.0.0.1 -P ${local_port} -u <USER> -p <DB_NAME>"
-                ;;
             5432)
                 echo "     psql -h 127.0.0.1 -p ${local_port} -U <USER> <DB_NAME>"
+                ;;
+            3306)
+                echo "     mysql -h 127.0.0.1 -P ${local_port} -u <USER> -p <DB_NAME>"
                 ;;
             *)
                 echo "     <client> -h 127.0.0.1 -p ${local_port}"
