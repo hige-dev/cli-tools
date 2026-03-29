@@ -1,6 +1,6 @@
 # nippou
 
-GitHub コミット・シェル履歴・Slack メッセージを収集し、Claude CLI で要約して日報 Markdown を生成するツール。
+GitHub コミット・シェル履歴・Claude Code セッション・Slack メッセージを収集し、Claude CLI で要約して日報 Markdown を生成するツール。
 
 ## 必要なもの
 
@@ -51,6 +51,7 @@ logs/
 | `GH_AUTHOR` | GitHub ユーザー名 | `gh` の認証ユーザーを自動取得 |
 | `REPORT_DIR` | 出力先ディレクトリ | カレントディレクトリ |
 | `HIST_FILE` | zsh 履歴ファイルのパス | `~/.zsh_history` |
+| `CLAUDE_HISTORY` | Claude Code 履歴ファイルのパス | `~/.claude/history.jsonl` |
 | `SLACK_TOKEN` | Slack User Token | 未設定（Slack 収集を無効化） |
 
 環境変数 `NIPPOU_CONF` で `.env` のパスを指定することもできる。

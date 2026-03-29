@@ -50,6 +50,7 @@ load_config() {
     GH_AUTHOR="${GH_AUTHOR:-$(gh api user --jq .login 2>/dev/null || echo "")}"
     REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/logs}"
     HIST_FILE="${HIST_FILE:-$HOME/.zsh_history}"
+    CLAUDE_HISTORY="${CLAUDE_HISTORY:-$HOME/.claude/history.jsonl}"
 }
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,29 @@ collect_slack() {
 }
 
 # ---------------------------------------------------------------------------
+# データ収集: Claude Code セッション履歴
+# ---------------------------------------------------------------------------
+
+collect_claude_sessions() {
+    local day="$1"
+    [[ -f "$CLAUDE_HISTORY" ]] || return 0
+
+    local ts_from ts_to
+    ts_from=$(date -d "${day} 00:00:00" +%s)000
+    ts_to=$(date -d "${day} 23:59:59" +%s)999
+
+    jq -r --arg lo "$ts_from" --arg hi "$ts_to" '
+        select(
+            (.timestamp | tonumber) >= ($lo | tonumber)
+            and (.timestamp | tonumber) <= ($hi | tonumber)
+            and (.project | startswith("/tmp") | not)
+            and (.display | length >= 5)
+        )
+        | "- [" + .project + "] " + (.display | split("\n")[0] | .[0:200])
+    ' "$CLAUDE_HISTORY" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # Claude による要約生成
 # ---------------------------------------------------------------------------
 
@@ -224,6 +248,10 @@ build_daily_report() {
     local shell_cmds
     shell_cmds=$(collect_shell_history "$day")
 
+    log_step "Claude セッション履歴を取得"
+    local claude_sessions
+    claude_sessions=$(collect_claude_sessions "$day")
+
     local slack_msgs=""
     if [[ -n "${SLACK_TOKEN:-}" ]]; then
         log_step "Slack メッセージを取得"
@@ -231,7 +259,7 @@ build_daily_report() {
     fi
 
     # --- データが何もなければ空レポート ---
-    if [[ -z "$commits" && -z "$shell_cmds" && -z "$slack_msgs" ]]; then
+    if [[ -z "$commits" && -z "$shell_cmds" && -z "$slack_msgs" && -z "$claude_sessions" ]]; then
         log_step "記録が見つかりませんでした"
         printf "# 日報 %s\n\n## 要約\n（記録なし）\n" "$day" > "$dest_file"
         return
@@ -239,9 +267,10 @@ build_daily_report() {
 
     # --- 収集データを結合 ---
     local sections=""
-    [[ -n "$commits" ]]   && sections+=$'\n## Gitコミット履歴\n'"${commits}"
-    [[ -n "$shell_cmds" ]] && sections+=$'\n\n## コマンド履歴\n'"${shell_cmds}"
-    [[ -n "$slack_msgs" ]] && sections+=$'\n\n## Slackメッセージ\n'"${slack_msgs}"
+    [[ -n "$commits" ]]         && sections+=$'\n## Gitコミット履歴\n'"${commits}"
+    [[ -n "$shell_cmds" ]]      && sections+=$'\n\n## コマンド履歴\n'"${shell_cmds}"
+    [[ -n "$claude_sessions" ]] && sections+=$'\n\n## Claude Codeセッション\n'"${claude_sessions}"
+    [[ -n "$slack_msgs" ]]      && sections+=$'\n\n## Slackメッセージ\n'"${slack_msgs}"
 
     # --- Claude で要約 ---
     log_step "Claude で要約を生成"
@@ -258,6 +287,9 @@ build_daily_report() {
         fi
         if [[ -n "$shell_cmds" ]]; then
             printf "## コマンド履歴\n\`\`\`bash\n%s\n\`\`\`\n\n" "$shell_cmds"
+        fi
+        if [[ -n "$claude_sessions" ]]; then
+            printf "## Claude Codeセッション\n%s\n\n" "$claude_sessions"
         fi
         if [[ -n "$slack_msgs" ]]; then
             printf "## Slackメッセージ\n%s\n\n" "$slack_msgs"
