@@ -14,7 +14,7 @@
 #   ./nippou.sh 2025-12-01             # 指定日を生成
 #   ./nippou.sh 2025-12-01 2025-12-05  # 期間指定で生成
 #   ./nippou.sh --monthly 2025-12      # 月報を生成（日報から集約）
-#   ./nippou.sh --monthly 2025-12 -o ./proni/  # 出力先を指定
+#   ./nippou.sh --monthly 2025-12 -o ./output/  # 出力先を指定
 #
 
 set -euo pipefail
