@@ -13,6 +13,8 @@
 #   ./nippou.sh                        # 前日分を生成
 #   ./nippou.sh 2025-12-01             # 指定日を生成
 #   ./nippou.sh 2025-12-01 2025-12-05  # 期間指定で生成
+#   ./nippou.sh --monthly 2025-12      # 月報を生成（日報から集約）
+#   ./nippou.sh --monthly 2025-12 -o ./proni/  # 出力先を指定
 #
 
 set -euo pipefail
@@ -50,6 +52,7 @@ load_config() {
     GH_AUTHOR="${GH_AUTHOR:-$(gh api user --jq .login 2>/dev/null || echo "")}"
     REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/logs}"
     HIST_FILE="${HIST_FILE:-$HOME/.zsh_history}"
+    CLAUDE_HISTORY="${CLAUDE_HISTORY:-$HOME/.claude/history.jsonl}"
 }
 
 # ---------------------------------------------------------------------------
@@ -160,6 +163,116 @@ collect_slack() {
 }
 
 # ---------------------------------------------------------------------------
+# データ収集: Claude Code セッション履歴
+# ---------------------------------------------------------------------------
+
+collect_claude_sessions() {
+    local day="$1"
+    [[ -f "$CLAUDE_HISTORY" ]] || return 0
+
+    local ts_from ts_to
+    ts_from=$(date -d "${day} 00:00:00" +%s)000
+    ts_to=$(date -d "${day} 23:59:59" +%s)999
+
+    jq -r --arg lo "$ts_from" --arg hi "$ts_to" '
+        select(
+            (.timestamp | tonumber) >= ($lo | tonumber)
+            and (.timestamp | tonumber) <= ($hi | tonumber)
+            and (.project | startswith("/tmp") | not)
+            and (.display | length >= 5)
+        )
+        | "- [" + .project + "] " + (.display | split("\n")[0] | .[0:200])
+    ' "$CLAUDE_HISTORY" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# 月報生成
+# ---------------------------------------------------------------------------
+
+MONTHLY_PROMPT_TEMPLATE='以下は %s の日報データをまとめたものです。
+
+これを職務経歴書に転用しやすい月報として日本語で整理してください。
+
+## フォーマット
+
+プロジェクト（リポジトリ）単位でグルーピングし、その中を施策ごとに分けること。
+
+```
+# 職務経歴サマリー（YYYY年MM月）
+
+## 担当プロジェクト・業務実績
+
+### プロジェクト名（リポジトリ名）
+**役割**: ロール名
+
+#### 施策タイトル（動詞で始める）
+- **背景/課題**: なぜやったのか（1-3行。障害、要請、技術的負債など動機を書く）
+- **打ち手と判断**: 何をしたか＋なぜその方法を選んだか
+- **成果**: 定量 or 定性（削減率、工数、SLO改善、リスク排除など）
+- **技術**: (使用技術をカンマ区切り)
+```
+
+## ルール
+- 施策タイトルは動詞で始める（「構築」「改善」「対応」など）
+- 背景/課題は具体的に書く。「〜が課題だった」で終わらせず、数値や影響を含める
+- 打ち手と判断では、技術選定の理由や他の選択肢との比較があればなお良い
+- 成果は可能な限り定量化する（%%, 件数, 時間, コスト）
+- 同一プロジェクト内で関連する小さな作業は1つの施策にまとめてよい
+- リポジトリが特定できない作業は「その他」にまとめる
+- 日報データから背景/課題が読み取れない場合は、コミット内容から推測して書く
+
+---
+%s'
+
+build_monthly_report() {
+    local year_month="$1"
+    local out_dir="${2:-${REPORT_DIR}}"
+
+    local year="${year_month:0:4}"
+    local month="${year_month:5:2}"
+    local report_src="${REPORT_DIR}/${year}/${month}"
+
+    if [[ ! -d "$report_src" ]]; then
+        echo "エラー: 日報ディレクトリが見つかりません: ${report_src}" >&2
+        exit 1
+    fi
+
+    local daily_files
+    daily_files=$(find "$report_src" -name '*.md' -type f | sort)
+    if [[ -z "$daily_files" ]]; then
+        echo "エラー: ${report_src} に日報ファイルがありません" >&2
+        exit 1
+    fi
+
+    local combined=""
+    while IFS= read -r f; do
+        combined+=$'\n\n---\n'"$(cat "$f")"
+    done <<< "$daily_files"
+
+    log_step "月報生成: ${year_month} ($(echo "$daily_files" | wc -l) 日分)"
+
+    local prompt_file
+    prompt_file=$(mktemp)
+    trap 'rm -f "$prompt_file"' RETURN
+
+    # shellcheck disable=SC2059
+    printf "$MONTHLY_PROMPT_TEMPLATE" "$year_month" "$combined" > "$prompt_file"
+
+    local dest_file="${out_dir}/${year}${month}.md"
+    mkdir -p "$(dirname "$dest_file")"
+
+    log_step "Claude で月報を生成中..."
+    local summary
+    summary=$(cd /tmp && claude -p < "$prompt_file" 2>/dev/null) \
+        || { echo "エラー: Claude による月報生成に失敗しました" >&2; exit 1; }
+
+    echo "$summary" > "$dest_file"
+    log_step "完了: ${dest_file}"
+    echo "--- プレビュー ---"
+    head -40 "$dest_file"
+}
+
+# ---------------------------------------------------------------------------
 # Claude による要約生成
 # ---------------------------------------------------------------------------
 
@@ -224,6 +337,10 @@ build_daily_report() {
     local shell_cmds
     shell_cmds=$(collect_shell_history "$day")
 
+    log_step "Claude セッション履歴を取得"
+    local claude_sessions
+    claude_sessions=$(collect_claude_sessions "$day")
+
     local slack_msgs=""
     if [[ -n "${SLACK_TOKEN:-}" ]]; then
         log_step "Slack メッセージを取得"
@@ -231,7 +348,7 @@ build_daily_report() {
     fi
 
     # --- データが何もなければ空レポート ---
-    if [[ -z "$commits" && -z "$shell_cmds" && -z "$slack_msgs" ]]; then
+    if [[ -z "$commits" && -z "$shell_cmds" && -z "$slack_msgs" && -z "$claude_sessions" ]]; then
         log_step "記録が見つかりませんでした"
         printf "# 日報 %s\n\n## 要約\n（記録なし）\n" "$day" > "$dest_file"
         return
@@ -239,9 +356,10 @@ build_daily_report() {
 
     # --- 収集データを結合 ---
     local sections=""
-    [[ -n "$commits" ]]   && sections+=$'\n## Gitコミット履歴\n'"${commits}"
-    [[ -n "$shell_cmds" ]] && sections+=$'\n\n## コマンド履歴\n'"${shell_cmds}"
-    [[ -n "$slack_msgs" ]] && sections+=$'\n\n## Slackメッセージ\n'"${slack_msgs}"
+    [[ -n "$commits" ]]         && sections+=$'\n## Gitコミット履歴\n'"${commits}"
+    [[ -n "$shell_cmds" ]]      && sections+=$'\n\n## コマンド履歴\n'"${shell_cmds}"
+    [[ -n "$claude_sessions" ]] && sections+=$'\n\n## Claude Codeセッション\n'"${claude_sessions}"
+    [[ -n "$slack_msgs" ]]      && sections+=$'\n\n## Slackメッセージ\n'"${slack_msgs}"
 
     # --- Claude で要約 ---
     log_step "Claude で要約を生成"
@@ -259,6 +377,9 @@ build_daily_report() {
         if [[ -n "$shell_cmds" ]]; then
             printf "## コマンド履歴\n\`\`\`bash\n%s\n\`\`\`\n\n" "$shell_cmds"
         fi
+        if [[ -n "$claude_sessions" ]]; then
+            printf "## Claude Codeセッション\n%s\n\n" "$claude_sessions"
+        fi
         if [[ -n "$slack_msgs" ]]; then
             printf "## Slackメッセージ\n%s\n\n" "$slack_msgs"
         fi
@@ -275,6 +396,21 @@ build_daily_report() {
 
 main() {
     load_config
+
+    # --monthly オプションの処理
+    if [[ "${1:-}" == "--monthly" ]]; then
+        local ym="${2:-}"
+        if [[ ! "$ym" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; then
+            echo "Usage: $0 --monthly YYYY-MM [-o OUTPUT_DIR]" >&2
+            exit 1
+        fi
+        local out_dir="${REPORT_DIR}"
+        if [[ "${3:-}" == "-o" && -n "${4:-}" ]]; then
+            out_dir="$4"
+        fi
+        build_monthly_report "$ym" "$out_dir"
+        return
+    fi
 
     local from to
     case $# in

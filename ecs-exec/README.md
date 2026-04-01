@@ -11,7 +11,7 @@
 ## 使い方
 
 ```bash
-./ecs-exec.sh <aws-profile>
+ecs_exec <aws-profile>
 ```
 
 実行すると以下の順で対話的に選択できる:

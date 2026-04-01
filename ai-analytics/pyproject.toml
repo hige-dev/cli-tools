@@ -1,0 +1,12 @@
+[project]
+name = "ai-analytics"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "duckdb>=1.5.1",
+    "langfuse>=4.0.1",
+    "python-dotenv>=1.2.2",
+    "pytz>=2026.1.post1",
+]
