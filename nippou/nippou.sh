@@ -12,7 +12,8 @@
 # Usage:
 #   ./nippou.sh                        # 前日分を生成
 #   ./nippou.sh 2025-12-01             # 指定日を生成
-#   ./nippou.sh 2025-12-01 2025-12-05  # 期間指定で生成
+#   ./nippou.sh 2025-12-01 2025-12-05  # 期間指定で生成（5並列）
+#   ./nippou.sh -j 3 2025-12-01 2025-12-05  # 並列数を指定
 #   ./nippou.sh --monthly 2025-12      # 月報を生成（日報から集約）
 #   ./nippou.sh --monthly 2025-12 -o ./output/  # 出力先を指定
 #
@@ -74,6 +75,8 @@ enumerate_days() {
 }
 
 log_step() { echo "-- $1"; }
+
+MAX_JOBS=5
 
 # ---------------------------------------------------------------------------
 # データ収集: GitHub コミット
@@ -412,6 +415,12 @@ build_daily_report() {
 main() {
     load_config
 
+    # -j オプションの解析
+    if [[ "${1:-}" == "-j" ]]; then
+        MAX_JOBS="${2:?Usage: $0 -j N ...}"
+        shift 2
+    fi
+
     # --monthly オプションの処理
     if [[ "${1:-}" == "--monthly" ]]; then
         local ym="${2:-}"
@@ -441,19 +450,59 @@ main() {
     days=$(enumerate_days "$from" "$to")
     num_days=$(echo "$days" | wc -l)
 
-    if (( num_days > 1 )); then
-        echo "期間: ${from} - ${to} (${num_days} 日間)"
-        echo ""
+    if (( num_days <= 1 )); then
+        # 1日だけなら逐次実行
+        build_daily_report "$from"
+        return
     fi
+
+    echo "期間: ${from} - ${to} (${num_days} 日間, 最大${MAX_JOBS}並列)"
+    echo ""
+
+    # 並列実行: 各日のログを一時ファイルに書き出し、完了順に表示
+    _NIPPOU_TMPDIR=$(mktemp -d)
+    trap 'rm -rf "$_NIPPOU_TMPDIR"' EXIT
+    local tmpdir="$_NIPPOU_TMPDIR"
+
+    local running=0
+    local pids=()
+    local pid_to_day=()
 
     while IFS= read -r d; do
-        build_daily_report "$d"
-        (( num_days > 1 )) && echo ""
+        (
+            build_daily_report "$d" > "${tmpdir}/${d}.log" 2>&1
+            echo $? > "${tmpdir}/${d}.rc"
+        ) &
+        pids+=($!)
+        pid_to_day+=("$d")
+        running=$((running + 1))
+
+        # 同時実行数が上限に達したら1つ完了を待つ
+        if (( running >= MAX_JOBS )); then
+            wait -n 2>/dev/null || true
+            running=$((running - 1))
+        fi
     done <<< "$days"
 
-    if (( num_days > 1 )); then
-        echo "${num_days} 日分のレポートを生成しました"
-    fi
+    # 残りのジョブを全て待つ
+    wait
+
+    # 日付順にログを表示
+    local failed=0
+    while IFS= read -r d; do
+        local rc=0
+        [[ -f "${tmpdir}/${d}.rc" ]] && rc=$(cat "${tmpdir}/${d}.rc")
+        if [[ "$rc" -ne 0 ]]; then
+            echo "✗ ${d}: 生成に失敗しました"
+            failed=$((failed + 1))
+        else
+            echo "✓ ${d}"
+        fi
+        [[ -f "${tmpdir}/${d}.log" ]] && cat "${tmpdir}/${d}.log"
+        echo ""
+    done <<< "$days"
+
+    echo "${num_days} 日分のレポートを生成しました (成功: $((num_days - failed)), 失敗: ${failed})"
 }
 
 main "$@"
