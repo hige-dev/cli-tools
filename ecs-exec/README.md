@@ -1,4 +1,5 @@
 # ecs-exec
+![demo](./ecs_exec.gif)
 
 `aws ecs execute-command` の対話型ラッパー。クラスタ・サービス・タスク・コンテナ・シェルを順に選択して接続する。
 

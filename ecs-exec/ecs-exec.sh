@@ -132,8 +132,13 @@ main() {
     shell=$(pick_one "シェル" "bash" "sh") || die "シェルが選択されませんでした"
 
     # --- 実行 ---
+    local cmd="aws ecs execute-command${PROFILE:+ --profile ${PROFILE}} --cluster ${cluster} --task ${task} --container ${container} --interactive --command ${shell}"
     echo ""
-    echo "=> aws ecs execute-command --cluster ${cluster} --task ${task} --container ${container} --interactive --command ${shell}"
+    echo "=== コマンド =================================="
+    echo ""
+    echo "${cmd}"
+    echo ""
+    echo "=============================================="
     echo ""
 
     aws ecs execute-command \
