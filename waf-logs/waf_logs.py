@@ -227,8 +227,53 @@ def download_logs(
 # ---------------------------------------------------------------------------
 
 
+def _configure_s3_access(db: duckdb.DuckDBPyConnection, session: boto3.Session, region: str) -> None:
+    """boto3 セッションの認証情報を DuckDB httpfs に設定する"""
+    db.execute("INSTALL httpfs")
+    db.execute("LOAD httpfs")
+
+    credentials = session.get_credentials()
+    if credentials is None:
+        die("AWS 認証情報を取得できませんでした")
+
+    frozen = credentials.get_frozen_credentials()
+    db.execute(f"SET s3_region = '{region}'")
+    db.execute(f"SET s3_access_key_id = '{frozen.access_key}'")
+    db.execute(f"SET s3_secret_access_key = '{frozen.secret_key}'")
+    if frozen.token:
+        db.execute(f"SET s3_session_token = '{frozen.token}'")
+
+
+def load_s3_to_duckdb(
+    db: duckdb.DuckDBPyConnection,
+    bucket: str,
+    keys: list[str],
+) -> int:
+    """S3 上の gzip JSON ログを DuckDB httpfs で直接取り込む"""
+    if not keys:
+        return 0
+
+    s3_urls = [f"s3://{bucket}/{key}" for key in keys]
+    url_list = ", ".join(f"'{u}'" for u in s3_urls)
+
+    db.execute(
+        f"""
+        CREATE TABLE waf_logs AS
+        SELECT * FROM read_json_auto(
+            [{url_list}],
+            compression='gzip',
+            maximum_object_size=10485760,
+            ignore_errors=true
+        )
+    """
+    )
+
+    count = db.execute("SELECT count(*) FROM waf_logs").fetchone()[0]
+    return count
+
+
 def load_to_duckdb(db: duckdb.DuckDBPyConnection, files: list[Path]) -> int:
-    """gzip JSON ログを DuckDB に取り込む"""
+    """ローカルの gzip JSON ログを DuckDB に取り込む"""
     all_lines = []
     for f in files:
         with gzip.open(f, "rt", encoding="utf-8") as gz:
@@ -604,6 +649,11 @@ def parse_args() -> argparse.Namespace:
         "--local-dir",
         help="ダウンロード済みログの .log.gz があるディレクトリ (S3 取得をスキップ)",
     )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="S3 からローカルにダウンロードしてから取り込む (従来方式)",
+    )
     return parser.parse_args()
 
 
@@ -662,12 +712,21 @@ def main() -> None:
     if existing:
         count = db.execute("SELECT count(*) FROM waf_logs").fetchone()[0]
         print(f"-- 既存の DuckDB ファイルを使用: {db_path} ({count:,} 件)")
-    else:
-        # --- ログファイルの取得 ---
+    elif args.local_dir or args.download:
+        # ローカルファイルから取り込み（--local-dir または --download）
         files = _fetch_log_files(args)
 
         print("DuckDB に取り込み中...")
         count = load_to_duckdb(db, files)
+        if count == 0:
+            die("ログレコードが 0 件です")
+    else:
+        # S3 から直接読み込み（デフォルト）
+        s3_info = _resolve_s3_log_location(args)
+
+        print("DuckDB httpfs で S3 から直接取り込み中...")
+        _configure_s3_access(db, s3_info["session"], s3_info["region"])
+        count = load_s3_to_duckdb(db, s3_info["bucket"], s3_info["keys"])
         if count == 0:
             die("ログレコードが 0 件です")
 
@@ -692,20 +751,8 @@ def main() -> None:
     db.close()
 
 
-def _fetch_log_files(args: argparse.Namespace) -> list[Path]:
-    """ローカルまたは S3 からログファイルを取得する"""
-    local_dir = Path(args.local_dir) if args.local_dir else None
-
-    if local_dir:
-        if not local_dir.is_dir():
-            die(f"ディレクトリが見つかりません: {local_dir}")
-        files = sorted(local_dir.glob("*.log.gz"))
-        if not files:
-            die(f".log.gz ファイルが見つかりません: {local_dir}")
-        print(f"-- ローカルディレクトリ: {local_dir}")
-        print(f"  {len(files)} ファイル見つかりました")
-        return files
-
+def _resolve_s3_log_location(args: argparse.Namespace) -> dict:
+    """S3 上の WAF ログの場所を特定し、バケット・キー一覧・セッションを返す"""
     # --- AWS セッション ---
     session_kwargs = {"region_name": args.region}
     if args.profile:
@@ -783,10 +830,34 @@ def _fetch_log_files(args: argparse.Namespace) -> list[Path]:
         die("指定期間のログファイルが見つかりません")
     print(f"  {len(keys)} ファイル見つかりました")
 
-    # --- ダウンロード ---
+    return {
+        "session": session,
+        "region": args.region,
+        "bucket": bucket,
+        "keys": keys,
+    }
+
+
+def _fetch_log_files(args: argparse.Namespace) -> list[Path]:
+    """ローカルまたは S3 からログファイルをダウンロードして取得する"""
+    local_dir = Path(args.local_dir) if args.local_dir else None
+
+    if local_dir:
+        if not local_dir.is_dir():
+            die(f"ディレクトリが見つかりません: {local_dir}")
+        files = sorted(local_dir.glob("*.log.gz"))
+        if not files:
+            die(f".log.gz ファイルが見つかりません: {local_dir}")
+        print(f"-- ローカルディレクトリ: {local_dir}")
+        print(f"  {len(files)} ファイル見つかりました")
+        return files
+
+    # S3 からダウンロード（--download モード）
+    s3_info = _resolve_s3_log_location(args)
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="waf-logs-"))
     print(f"  ダウンロード先: {tmp_dir}")
-    files = download_logs(session, bucket, keys, tmp_dir)
+    files = download_logs(s3_info["session"], s3_info["bucket"], s3_info["keys"], tmp_dir)
     if not files:
         die("ダウンロードしたファイルがありません")
 
