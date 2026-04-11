@@ -1,10 +1,15 @@
 #!/bin/bash
 # aws_logs コマンドのエントリポイント
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
 
-# .venv があれば自動で activate
-if [[ -f "${SCRIPT_DIR}/.venv/bin/python" ]]; then
-    exec "${SCRIPT_DIR}/.venv/bin/python" -m aws_logs "$@"
-fi
+# venv の python を探す
+PYTHON=$(command -v python3 || command -v python)
+for vdir in .venv venv; do
+    if [[ -f "${SCRIPT_DIR}/${vdir}/bin/python" ]]; then
+        PYTHON="${SCRIPT_DIR}/${vdir}/bin/python"
+        break
+    fi
+done
 
-exec python3 -m aws_logs "$@"
+exec "$PYTHON" -m aws_logs "$@"
