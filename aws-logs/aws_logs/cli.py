@@ -1,4 +1,4 @@
-"""aws-logs - AWS ログ分析ツール (WAF / CloudFront / ALB)"""
+"""aws-logs - AWS ログ分析ツール (WAF / CloudFront / ALB / CloudWatch Logs)"""
 
 import argparse
 import sys
@@ -42,6 +42,7 @@ from .core.utils import die
 from .providers.alb import AlbProvider
 from .providers.base import LogProvider
 from .providers.cloudfront import CloudFrontProvider
+from .providers.cwl import CwlProvider
 from .providers.waf import WafProvider
 
 
@@ -49,63 +50,157 @@ PROVIDERS = {
     "waf": WafProvider,
     "cf": CloudFrontProvider,
     "alb": AlbProvider,
+    "cwl": CwlProvider,
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="aws_logs",
-        description="AWS ログ分析ツール (WAF / CloudFront / ALB)",
+        description="AWS ログ分析ツール (WAF / CloudFront / ALB / CloudWatch Logs)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "使用例:\n"
+            "  aws_logs waf                        直近1時間の WAF ログを分析\n"
+            "  aws_logs cf --hours 6               直近6時間の CloudFront ログ\n"
+            "  aws_logs alb --from '2026-04-15 09:00' --to '2026-04-15 10:00'\n"
+            "  aws_logs cwl -p production           本番環境の CloudWatch Logs\n"
+            "  aws_logs waf --db ./saved.duckdb     保存済み DB を再利用"
+        ),
     )
 
     subparsers = parser.add_subparsers(dest="subcommand", help="ログ種別")
 
     # 各サブコマンドに共通オプションを追加するヘルパー
-    def add_common_args(sub: argparse.ArgumentParser) -> None:
-        sub.add_argument("--profile", "-p", help="AWS プロファイル")
-        sub.add_argument(
-            "--region", "-r",
-            default="ap-northeast-1",
-            help="AWS リージョン (default: ap-northeast-1)",
-        )
-        sub.add_argument(
+    def add_common_args(sub: argparse.ArgumentParser, is_s3: bool = True) -> None:
+        # 期間指定グループ
+        time_group = sub.add_argument_group("期間指定")
+        time_group.add_argument(
             "--from", dest="time_from",
-            help="開始日時 (例: 2024-01-01 09:00)",
+            metavar="DATETIME",
+            help=(
+                "開始日時。以下の形式に対応:\n"
+                "  '2026-04-15 09:00'  (日時)\n"
+                "  '2026-04-15'        (日付のみ = 00:00)\n"
+                "  未指定時は --hours で直近N時間を取得"
+            ),
         )
-        sub.add_argument(
+        time_group.add_argument(
             "--to", dest="time_to",
-            help="終了日時 (例: 2024-01-01 10:00)",
+            metavar="DATETIME",
+            help="終了日時 (--from と同じ形式。未指定時は現在時刻)",
         )
-        sub.add_argument(
+        time_group.add_argument(
             "--hours", type=int,
+            metavar="N",
             help="直近N時間を取得 (--from/--to 未指定時のデフォルト: 1)",
         )
-        sub.add_argument(
+
+        # AWS 接続グループ
+        aws_group = sub.add_argument_group("AWS 接続")
+        aws_group.add_argument(
+            "--profile", "-p",
+            metavar="NAME",
+            help="AWS プロファイル名 (~/.aws/config のプロファイル)",
+        )
+        aws_group.add_argument(
+            "--region", "-r",
+            default="ap-northeast-1",
+            metavar="REGION",
+            help="AWS リージョン (デフォルト: ap-northeast-1)",
+        )
+
+        # DB グループ
+        db_group = sub.add_argument_group("データベース")
+        db_group.add_argument(
             "--db",
-            help="DuckDB ファイルパス (デフォルト: /tmp/{name}-{timestamp}.duckdb)",
+            metavar="PATH",
+            help=(
+                "DuckDB ファイルパス。既存ファイルを指定すると\n"
+                "ログ取得をスキップして即座に分析を開始する\n"
+                "(デフォルト: /tmp/{name}-{timestamp}.duckdb)"
+            ),
         )
-        sub.add_argument(
+        db_group.add_argument(
             "--memory", action="store_true",
-            help="インメモリモード (DB ファイルを作成しない)",
+            help="インメモリモード (DB ファイルをディスクに残さない)",
         )
-        sub.add_argument(
-            "--local-dir",
-            help="ダウンロード済みログのディレクトリ (S3 取得をスキップ)",
-        )
-        sub.add_argument(
-            "--download", action="store_true",
-            help="S3 からローカルにダウンロードしてから取り込む (従来方式)",
-        )
+
+        if is_s3:
+            s3_group = sub.add_argument_group("取得方式 (S3)")
+            s3_group.add_argument(
+                "--local-dir",
+                metavar="DIR",
+                help="ダウンロード済みログのディレクトリを指定 (S3 取得をスキップ)",
+            )
+            s3_group.add_argument(
+                "--download", action="store_true",
+                help="S3 からローカルにダウンロードしてから取り込む (従来方式)",
+            )
+        else:
+            # 非S3 プロバイダーでも argparse エラーを防ぐためデフォルト値を設定
+            sub.set_defaults(local_dir=None, download=False)
 
     # サブコマンド
-    waf_parser = subparsers.add_parser("waf", help="WAF ログ分析")
+    waf_parser = subparsers.add_parser(
+        "waf", help="WAF ログ分析",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="AWS WAF ログを S3 から取り込んで分析する",
+        epilog=(
+            "使用例:\n"
+            "  aws_logs waf                        直近1時間\n"
+            "  aws_logs waf --hours 24              直近24時間\n"
+            "  aws_logs waf --from '2026-04-14' --to '2026-04-15'\n"
+            "  aws_logs waf -p staging --db ./waf.duckdb"
+        ),
+    )
     add_common_args(waf_parser)
 
-    cf_parser = subparsers.add_parser("cf", help="CloudFront ログ分析")
+    cf_parser = subparsers.add_parser(
+        "cf", help="CloudFront ログ分析",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="CloudFront アクセスログを S3 から取り込んで分析する",
+        epilog=(
+            "使用例:\n"
+            "  aws_logs cf                         直近1時間\n"
+            "  aws_logs cf --hours 6 -p production\n"
+            "  aws_logs cf --from '2026-04-15 09:00' --to '2026-04-15 10:00'"
+        ),
+    )
     add_common_args(cf_parser)
 
-    alb_parser = subparsers.add_parser("alb", help="ALB ログ分析")
+    alb_parser = subparsers.add_parser(
+        "alb", help="ALB ログ分析",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="ALB アクセスログを S3 から取り込んで分析する",
+        epilog=(
+            "使用例:\n"
+            "  aws_logs alb                        直近1時間\n"
+            "  aws_logs alb --hours 3 --memory\n"
+            "  aws_logs alb --from '2026-04-15 14:00' --to '2026-04-15 15:00'"
+        ),
+    )
     add_common_args(alb_parser)
+
+    cwl_parser = subparsers.add_parser(
+        "cwl", help="CloudWatch Logs 分析",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "CloudWatch Logs のログイベントを API 経由で取得し分析する\n"
+            "ECS・Lambda などのロググループに対応"
+        ),
+        epilog=(
+            "使用例:\n"
+            "  aws_logs cwl                        直近1時間\n"
+            "  aws_logs cwl --hours 3 -p production\n"
+            "  aws_logs cwl --from '2026-04-15 09:00' --to '2026-04-15 10:00'\n"
+            "\n"
+            "注意:\n"
+            "  CloudWatch Logs API (FilterLogEvents) で取得するため、\n"
+            "  大量のログ取得時には時間がかかる場合があります"
+        ),
+    )
+    add_common_args(cwl_parser, is_s3=False)
 
     args = parser.parse_args()
 
@@ -126,6 +221,21 @@ def run(args: argparse.Namespace, provider: LogProvider) -> None:
     if check_existing_table(db, provider.table_name):
         count = db.execute(f"SELECT count(*) FROM {provider.table_name}").fetchone()[0]
         print(f"-- 既存の DuckDB ファイルを使用: {db_path} ({count:,} 件)")
+    elif not provider.uses_s3:
+        # API 経由でログを取得 (CloudWatch Logs など)
+        session = create_session(args.profile, args.region)
+        print_session_info(session, args.region, args.profile)
+        account_id = get_account_id(session)
+        start, end = resolve_time_range(args.time_from, args.time_to, args.hours)
+
+        print(
+            f"-- 期間: {start.strftime('%Y-%m-%d %H:%M')} ~ "
+            f"{end.strftime('%Y-%m-%d %H:%M')} (UTC)"
+        )
+
+        count = provider.fetch_and_load(db, session, args.region, account_id, start, end)
+        if count == 0:
+            die("ログレコードが 0 件です")
     elif args.local_dir or args.download:
         # ローカルファイルから取り込み
         files = _fetch_local_files(args, provider)

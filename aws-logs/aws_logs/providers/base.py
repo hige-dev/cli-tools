@@ -1,7 +1,9 @@
 """LogProvider 抽象基底クラス"""
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 
+import boto3
 import duckdb
 
 
@@ -20,6 +22,11 @@ class LogProvider(ABC):
     @abstractmethod
     def shell_prompt(self) -> str:
         """SQL シェルのプロンプト (例: "waf> ")"""
+
+    @property
+    def uses_s3(self) -> bool:
+        """S3 経由でログを取得するかどうか (デフォルト: True)"""
+        return True
 
     @property
     @abstractmethod
@@ -67,3 +74,18 @@ class LogProvider(ABC):
     def warn_sensitive_data(self, db: duckdb.DuckDBPyConnection) -> None:
         """機微情報の警告（必要なプロバイダーのみオーバーライド）"""
         pass
+
+    def fetch_and_load(
+        self,
+        db: duckdb.DuckDBPyConnection,
+        session: boto3.Session,
+        region: str,
+        account_id: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """API 経由でログを取得し DuckDB に取り込む (非S3プロバイダー用)
+
+        戻り値: 取り込んだレコード数
+        """
+        raise NotImplementedError
