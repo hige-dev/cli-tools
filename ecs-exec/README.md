@@ -111,9 +111,10 @@ ecs_exec <aws-profile>
 
 ## IAM ポリシー
 
-### 1. 実行者 (ecs_exec を実行するユーザー / ロール) 用
+<details>
+<summary><b>1. 実行者 (ecs_exec を実行するユーザー / ロール) 用</b></summary>
 
-全機能を利用する場合のサンプル。不要な機能は該当 Statement を削除してください。
+全機能を利用する場合のサンプル。不要な機能は該当 Statement を削除してください。最小構成（通常の ecs_exec のみ利用）の場合は `EcsExecBase` のみで動作します。
 
 ```json
 {
@@ -175,9 +176,10 @@ ecs_exec <aws-profile>
 }
 ```
 
-最小構成（通常の ecs_exec のみ利用）の場合は `EcsExecBase` のみで動作します。
+</details>
 
-### 2. タスクロール側 (接続先コンテナ) 用
+<details>
+<summary><b>2. タスクロール側 (接続先コンテナ) 用</b></summary>
 
 ECS Exec で接続するコンテナのタスクロールには SSM メッセージング権限が必要です。一時デバッグタスクも同じタスクロールを流用するため、この権限が無いと接続できません。
 
@@ -200,3 +202,5 @@ ECS Exec で接続するコンテナのタスクロールには SSM メッセー
 ```
 
 ※ タスクロールに付与権限がない場合は、環境変数 `ECS_DEBUG_TASK_ROLE_ARN` で上記権限を持つ別ロールを指定可能。
+
+</details>
