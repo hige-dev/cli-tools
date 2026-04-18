@@ -106,7 +106,97 @@ ecs_exec <aws-profile>
 ## 前提条件
 
 - 対象タスクで ECS Exec が有効化されていること（`enableExecuteCommand: true`） — 無効時は上記フォールバックを利用
-- IAM に `ecs:ExecuteCommand` 権限があること
 - Session Manager Plugin がインストール済みであること
-- 一時デバッグタスクを使う場合は `ecs:RegisterTaskDefinition` / `ecs:RunTask` / `ecs:StopTask` / `iam:PassRole` も必要
-- CloudShell VPC を使う場合、IAM に `cloudshell:*` と関連 VPC 権限があること
+- 後述の IAM ポリシーが付与されていること（実行者・タスクロール両方）
+
+## IAM ポリシー
+
+### 1. 実行者 (ecs_exec を実行するユーザー / ロール) 用
+
+全機能を利用する場合のサンプル。不要な機能は該当 Statement を削除してください。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcsExecBase",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ecs:ListClusters",
+        "ecs:ListServices",
+        "ecs:DescribeServices",
+        "ecs:ListTasks",
+        "ecs:DescribeTasks",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ExecuteCommand"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcsExecDebugTask",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:RunTask",
+        "ecs:StopTask"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassRoleForDebugTask",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "CloudShellVpcDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeNetworkInterfaces"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudShell",
+      "Effect": "Allow",
+      "Action": [
+        "cloudshell:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+最小構成（通常の ecs_exec のみ利用）の場合は `EcsExecBase` のみで動作します。
+
+### 2. タスクロール側 (接続先コンテナ) 用
+
+ECS Exec で接続するコンテナのタスクロールには SSM メッセージング権限が必要です。一時デバッグタスクも同じタスクロールを流用するため、この権限が無いと接続できません。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+※ タスクロールに付与権限がない場合は、環境変数 `ECS_DEBUG_TASK_ROLE_ARN` で上記権限を持つ別ロールを指定可能。
