@@ -425,7 +425,7 @@ main() {
         echo ""
         local action
         action=$(pick_one "代替手段を選択" \
-            "一時デバッグタスク (netshoot) を起動" \
+            "一時デバッグタスクを起動" \
             "CloudShell VPC でネットワーク調査" \
             "中止") \
             || die "選択されませんでした"
@@ -470,19 +470,12 @@ main() {
     container=$(pick_one "コンテナ" "${containers[@]}") || die "コンテナが選択されませんでした"
     echo "-- コンテナ: ${container}"
 
-    # --- 実行 (bash → sh 自動フォールバック) ---
-    run_execute_command() {
-        local shell_cmd="$1"
-        aws ecs execute-command \
-            ${PROFILE:+--profile "$PROFILE"} \
-            --cluster "$cluster" \
-            --task "$task" \
-            --container "$container" \
-            --interactive \
-            --command "$shell_cmd"
-    }
+    # --- 実行 ---
+    # デフォルトは sh (bash 非搭載コンテナでの接続失敗タイムアウト回避)。
+    # bash を使いたい場合は ECS_EXEC_SHELL=bash を指定。
+    local shell_cmd="${ECS_EXEC_SHELL:-sh}"
 
-    local cmd_display="aws ecs execute-command${PROFILE:+ --profile ${PROFILE}} --cluster ${cluster} --task ${task} --container ${container} --interactive --command bash  (失敗時: sh で再試行)"
+    local cmd_display="aws ecs execute-command${PROFILE:+ --profile ${PROFILE}} --cluster ${cluster} --task ${task} --container ${container} --interactive --command ${shell_cmd}"
     echo ""
     echo "=== コマンド =================================="
     echo ""
@@ -491,12 +484,13 @@ main() {
     echo "=============================================="
     echo ""
 
-    if ! run_execute_command bash; then
-        echo ""
-        echo "-- bash で接続できなかったため sh で再試行します"
-        echo ""
-        run_execute_command sh
-    fi
+    aws ecs execute-command \
+        ${PROFILE:+--profile "$PROFILE"} \
+        --cluster "$cluster" \
+        --task "$task" \
+        --container "$container" \
+        --interactive \
+        --command "$shell_cmd"
 }
 
 main "$@"

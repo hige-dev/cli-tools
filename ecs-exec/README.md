@@ -22,7 +22,11 @@ ecs_exec <aws-profile>
 3. タスク（RUNNING のみ）
 4. コンテナ
 
-選択肢が1つしかない場合は自動で確定する。シェルは常に `bash` で接続し、bash が無いコンテナでは自動的に `sh` で再接続する。
+選択肢が1つしかない場合は自動で確定する。シェルはデフォルトで `sh` で接続する（bash 非搭載コンテナでのタイムアウト回避のため）。bash を使いたい場合は環境変数で切替:
+
+```bash
+ECS_EXEC_SHELL=bash ecs_exec <aws-profile>
+```
 
 ## ECS Exec が無効な場合の代替
 
