@@ -9,8 +9,8 @@
 #   .env.example を .env にコピーして編集する。
 #   NIPPOU_CONF 環境変数で .env のパスを指定可能。
 #
-# Usage:
-#   ./nippou.sh                        # 前日分を生成
+# 使い方:
+#   ./nippou.sh                        # 当日分を生成
 #   ./nippou.sh 2025-12-01             # 指定日を生成
 #   ./nippou.sh 2025-12-01 2025-12-05  # 期間指定で生成（5並列）
 #   ./nippou.sh -j 3 2025-12-01 2025-12-05  # 並列数を指定
@@ -47,11 +47,29 @@ load_config() {
         source "$conf"
     fi
 
-    # 環境変数 > .env > デフォルト の優先度で解決
-    GH_AUTHOR="${GH_AUTHOR:-$(gh api user --jq .login 2>/dev/null || echo "")}"
+    # 設定ファイルを読み込んだ後、未設定値に既定値を適用する
+    GH_AUTHOR="${GH_AUTHOR-$(gh api user --jq .login 2>/dev/null || echo "")}"
     REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/logs}"
     HIST_FILE="${HIST_FILE:-$HOME/.zsh_history}"
     CLAUDE_HISTORY="${CLAUDE_HISTORY:-$HOME/.claude/history.jsonl}"
+    CLAUDE_MAX_ATTEMPTS="${CLAUDE_MAX_ATTEMPTS:-3}"
+    CLAUDE_RETRY_WAIT="${CLAUDE_RETRY_WAIT:-15}"
+    DOC_ROOTS="${DOC_ROOTS:-$HOME/work}"
+    CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+    DOC_MAX_FILES="${DOC_MAX_FILES:-20}"
+    DOC_MAX_LINES="${DOC_MAX_LINES:-60}"
+    PR_BODY_MAX_CHARS="${PR_BODY_MAX_CHARS:-800}"
+    local name
+    for name in CLAUDE_MAX_ATTEMPTS DOC_MAX_FILES DOC_MAX_LINES PR_BODY_MAX_CHARS; do
+        if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "エラー: ${name} は正の整数で指定してください" >&2
+            return 1
+        fi
+    done
+    if [[ ! "$CLAUDE_RETRY_WAIT" =~ ^[0-9]+$ ]]; then
+        echo "エラー: CLAUDE_RETRY_WAIT は非負の整数で指定してください" >&2
+        return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -74,7 +92,36 @@ enumerate_days() {
     done
 }
 
-log_step() { echo "-- $1"; }
+log_step() { echo "-- $1" >&2; }
+
+daily_path() { printf '%s/%s/%s/%s.md\n' "$REPORT_DIR" "${1:0:4}" "${1:5:2}" "$1"; }
+
+run_claude() {
+    local prompt_file="$1"
+    shift
+    local tmp attempt wait_seconds rc=1 error
+    tmp=$(mktemp -d)
+    wait_seconds=$((10#$CLAUDE_RETRY_WAIT))
+    for ((attempt=1; attempt<=CLAUDE_MAX_ATTEMPTS; attempt++)); do
+        if (cd /tmp && claude -p "$@" < "$prompt_file" > "$tmp/out" 2> "$tmp/err"); then
+            cat "$tmp/out"
+            rm -rf "$tmp"
+            return 0
+        else
+            rc=$?
+        fi
+        error=$(cat "$tmp/err")
+        [[ -n "$error" ]] || error=$(cat "$tmp/out")
+        log_step "Claude の実行失敗 (${attempt}/${CLAUDE_MAX_ATTEMPTS}): ${error:0:200}"
+        if (( attempt < CLAUDE_MAX_ATTEMPTS )); then
+            sleep "$wait_seconds"
+            wait_seconds=$((wait_seconds * 2))
+        fi
+    done
+    rm -rf "$tmp"
+    return "$rc"
+}
+
 
 MAX_JOBS=5
 
@@ -274,7 +321,7 @@ build_monthly_report() {
 
     log_step "Claude で月報を生成中..."
     local summary
-    summary=$(cd /tmp && claude -p < "$prompt_file" 2>/dev/null) \
+    summary=$(run_claude "$prompt_file") \
         || { rm -f "$prompt_file"; echo "エラー: Claude による月報生成に失敗しました" >&2; exit 1; }
 
     rm -f "$prompt_file"
@@ -326,7 +373,7 @@ ${raw_data}
 PROMPT
 
     local result
-    result=$(cd /tmp && claude -p < "$prompt_file" 2>/dev/null) \
+    result=$(run_claude "$prompt_file") \
         || result="（要約の生成に失敗しました）"
     rm -f "$prompt_file"
     echo "$result"
@@ -340,8 +387,8 @@ build_daily_report() {
     local day="$1"
 
     local dest_dir dest_file
-    dest_dir="${REPORT_DIR}/${day:0:4}/${day:5:2}"
-    dest_file="${dest_dir}/${day}.md"
+    dest_file=$(daily_path "$day")
+    dest_dir=$(dirname "$dest_file")
 
     log_step "対象日: ${day}  出力先: ${dest_file}"
     mkdir -p "$dest_dir"
@@ -417,7 +464,7 @@ main() {
 
     # -j オプションの解析
     if [[ "${1:-}" == "-j" ]]; then
-        MAX_JOBS="${2:?Usage: $0 -j N ...}"
+        MAX_JOBS="${2:?使い方: $0 -j N ...}"
         shift 2
     fi
 
@@ -425,7 +472,7 @@ main() {
     if [[ "${1:-}" == "--monthly" ]]; then
         local ym="${2:-}"
         if [[ ! "$ym" =~ ^[0-9]{4}-(0[1-9]|1[0-2])$ ]]; then
-            echo "Usage: $0 --monthly YYYY-MM [-o OUTPUT_DIR]" >&2
+            echo "使い方: $0 --monthly YYYY-MM [-o OUTPUT_DIR]" >&2
             exit 1
         fi
         local out_dir="${REPORT_DIR}"
@@ -438,13 +485,19 @@ main() {
 
     local from to
     case $# in
-        0) from=$(date -d yesterday +%Y-%m-%d); to="$from" ;;
+        0) from=$(date +%Y-%m-%d); to="$from" ;;
         1) from="$1"; to="$1" ;;
         *) from="$1"; to="$2" ;;
     esac
 
     check_date "$from"
     check_date "$to"
+    from=$(date -d "$from" +%Y-%m-%d)
+    to=$(date -d "$to" +%Y-%m-%d)
+    if [[ "$from" > "$to" || ! "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "エラー: 日付の順序または並列数が不正です" >&2
+        return 1
+    fi
 
     local days num_days
     days=$(enumerate_days "$from" "$to")
@@ -470,8 +523,8 @@ main() {
 
     while IFS= read -r d; do
         (
+            trap 'echo "$?" > "${tmpdir}/${d}.rc"' EXIT
             build_daily_report "$d" > "${tmpdir}/${d}.log" 2>&1
-            echo $? > "${tmpdir}/${d}.rc"
         ) &
         pids+=($!)
         pid_to_day+=("$d")
@@ -491,7 +544,7 @@ main() {
     local failed=0
     while IFS= read -r d; do
         local rc=0
-        [[ -f "${tmpdir}/${d}.rc" ]] && rc=$(cat "${tmpdir}/${d}.rc")
+        if [[ -f "${tmpdir}/${d}.rc" ]]; then rc=$(cat "${tmpdir}/${d}.rc"); else rc=1; fi
         if [[ "$rc" -ne 0 ]]; then
             echo "✗ ${d}: 生成に失敗しました"
             failed=$((failed + 1))
@@ -503,6 +556,9 @@ main() {
     done <<< "$days"
 
     echo "${num_days} 日分のレポートを生成しました (成功: $((num_days - failed)), 失敗: ${failed})"
+    (( failed == 0 ))
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
