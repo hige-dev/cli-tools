@@ -14,6 +14,8 @@ chmod 600 "$NIPPOU_CONF"
 export GH_AUTHOR=me REPORT_DIR="$test_tmp/reports" HIST_FILE="$test_tmp/history"
 export CLAUDE_HISTORY="$test_tmp/claude-history" CLAUDE_PROJECTS_DIR="$test_tmp/projects"
 export DOC_ROOTS="$fixture/docs" SLACK_TOKEN="" SLACK_DRAFT_CHANNEL=""
+export GOAL_SHEET_URL="" GOAL_SHEET_PERSON="" NOTION_INITIATIVES_URL=""
+unset GOAL_SHEET_READ_TOOLS NOTION_READ_TOOLS
 export CLAUDE_MAX_ATTEMPTS=3 CLAUDE_RETRY_WAIT=0 DOC_MAX_FILES=20 DOC_MAX_LINES=60 PR_BODY_MAX_CHARS=800
 source "$SCRIPT_DIR/nippou.sh"
 load_config
@@ -89,6 +91,10 @@ gh() {
 collect_commits 2026-10-08 > "$test_tmp/commits"
 contains "$test_tmp/commits" '- 実装を検証 https://github.com/owner/repo/commit/abc'
 absent "$test_tmp/commits" '本文'
+gh() { echo '検索 API が失敗しました' >&2; return 7; }
+collect_commits 2026-10-08 > "$test_tmp/failed-commits" 2> "$test_tmp/commit-errors"
+contains "$test_tmp/commit-errors" '検索 API が失敗しました'
+contains "$test_tmp/commit-errors" '警告: コミット検索に失敗'
 eval "$saved_gh"
 curl() {
     jq -nc '{messages:{matches:[{text:"短文",channel:{name:"repo"},permalink:"短文URL"},{text:("あ" * 210),channel:{name:"repo"},permalink:"https://slack.example/message"}]}}'
@@ -144,9 +150,14 @@ absent "$test_tmp/limited-lines" '確認した背景と判断'
 # 要約を一度だけ呼び、一覧見出しの表記揺れを受け入れる。
 claude() {
     cat > "$test_tmp/prompt"
-    printf '%s\n' "$*" >> "$test_tmp/claude-calls"
+    jq -cn --args '$ARGS.positional' -- "$@" >> "$test_tmp/claude-calls"
     cat <<'SUMMARY'
+## 施策
 施策の要約本文
+[実在 PR](https://github.com/owner/repo/pull/1)
+[架空のリンク](https://www.notion.so/unseen)
+<https://example.invalid/slack|未確認の表示名>
+https://example.invalid/bare
 
 ## やったこと（Slack 用）
 ■ repo
@@ -168,6 +179,13 @@ contains "$daily" "$DOC_ROOTS/ignored.md"
 absent "$daily" '確認した背景と判断'
 contains "$test_tmp/prompt" '確認した背景と判断'
 equal "$(wc -l < "$test_tmp/claude-calls" | tr -d ' ')" 1
+jq -e 'index("--tools") as $i | $i != null and .[$i+1] == "" and index("--strict-mcp-config") != null and index("mcp__*") != null' "$test_tmp/claude-calls" > /dev/null || fail '要約でツールが禁止されていません'
+contains "$daily" '#### 施策'
+contains "$daily" '[実在 PR](https://github.com/owner/repo/pull/1)'
+contains "$daily" '架空のリンク'
+contains "$daily" '未確認の表示名'
+absent "$daily" 'https://www.notion.so/unseen'
+absent "$daily" 'https://example.invalid/'
 awk '/^## 要約$/ {s=1;next} s && /^## / {exit} s {print}' "$daily" > "$test_tmp/summary"
 absent "$test_tmp/summary" '判断を記録'
 cat > "$test_tmp/expected-tail" <<'TAIL'
@@ -187,6 +205,67 @@ for headings in 'やったこと|明日やること' '## やったこと|## 明�
     equal "$(cat "$test_tmp/heading-body")" ''
 done
 
+# 読み取り専用のコネクタで集めた目標と施策を、要約の入力・保存先へ渡す。
+(
+    GOAL_SHEET_URL='https://docs.google.com/spreadsheets/d/goals'
+    GOAL_SHEET_PERSON='本人'
+    NOTION_INITIATIVES_URL='https://www.notion.so/initiatives'
+    : > "$test_tmp/context-calls"
+    claude() {
+        local prompt
+        prompt=$(cat)
+        printf '%s\n' "$prompt" > "$test_tmp/context-prompt"
+        jq -cn --args '$ARGS.positional' -- "$@" >> "$test_tmp/context-calls"
+        if [[ "$prompt" == *'Google Drive コネクタ'* ]]; then
+            echo '{"month":"2026-10","person":"本人","goals":"目標にある次の検証"}'
+        elif [[ "$prompt" == *'Notion コネクタ'* ]]; then
+            echo '{"initiatives":[{"name":"根拠収集","url":"https://www.notion.so/evidence","summary":"本人の判断を根拠に残す"}]}'
+        else
+            cat <<'SUMMARY'
+#### 根拠収集
+本人の判断を記録
+
+やったこと
+■ [根拠収集](https://www.notion.so/evidence)
+  - [検証対象の PR](https://github.com/owner/repo/pull/1)
+  - [未確認の PR](https://github.com/owner/repo/pull/999)
+
+明日やること
+■ 根拠収集
+  - 目標にある次の検証
+SUMMARY
+        fi
+    }
+    build_daily_report 2026-10-08 > "$test_tmp/context-stdout"
+    contains "$test_tmp/context-prompt" '目標にある次の検証'
+    contains "$test_tmp/context-prompt" '本人の判断を根拠に残す'
+    contains "$daily" '## 当月の目標（本人行・予定の参考情報）'
+    contains "$daily" '■ [根拠収集](https://www.notion.so/evidence)'
+    contains "$daily" '[検証対象の PR](https://github.com/owner/repo/pull/1)'
+    absent "$daily" 'https://github.com/owner/repo/pull/999'
+    equal "$(wc -l < "$test_tmp/context-calls" | tr -d ' ')" 3
+    head -2 "$test_tmp/context-calls" | jq -e '
+        index("--permission-mode") as $p | index("--setting-sources") as $s
+        | .[$p+1] == "dontAsk" and .[$s+1] == ""
+        and index("mcp__claude_ai_Slack__slack_send_message") != null
+        and index("mcp__claude_ai_Slack__slack_schedule_message") != null
+        and index("--strict-mcp-config") == null' > /dev/null || fail 'コネクタの権限制限が不正です'
+    head -1 "$test_tmp/context-calls" | jq -e 'index("mcp__claude_ai_Google_Drive__google_drive_fetch") != null' > /dev/null || fail '目標の読み取りツールがありません'
+    sed -n '2p' "$test_tmp/context-calls" | jq -e 'index("mcp__claude_ai_Notion__fetch") != null' > /dev/null || fail '施策の読み取りツールがありません'
+
+    # 別の月・他人の行・壊れた応答は、目標として採用しない。
+    for reply in '{"month":"2026-09","person":"本人","goals":"別の月"}' '{"month":"2026-10","person":"別人","goals":"他人の行"}' '壊れた JSON'; do
+        claude() { cat > /dev/null; printf '%s\n' "$reply"; }
+        collect_goal_sheet 2026-10-08 > "$test_tmp/wrong-goals" 2> "$test_tmp/goal-errors"
+        equal "$(cat "$test_tmp/wrong-goals")" ''
+        contains "$test_tmp/goal-errors" '警告: 対象月の目標シートの本人行を取得できません'
+    done
+    claude() { cat > /dev/null; echo 'コネクタ接続エラー' >&2; return 7; }
+    collect_notion_initiatives 2026-10-08 '本人の作業' > "$test_tmp/no-initiatives" 2> "$test_tmp/notion-errors"
+    equal "$(cat "$test_tmp/no-initiatives")" ''
+    contains "$test_tmp/notion-errors" '警告: 作業に対応する Notion の施策を取得できません'
+)
+
 collect_pull_requests() { :; }
 collect_local_docs() { :; }
 create_notes 2026-10-09
@@ -195,7 +274,7 @@ contains "$(daily_path 2026-10-09)" '## 本人補足（生成時点）'
 build_daily_report 2026-10-10 > /dev/null
 contains "$(daily_path 2026-10-10)" '（記録なし）'
 # 見出しのない返答でも追加のモデル呼び出しをしない。
-claude() { cat > "$test_tmp/prompt"; echo '一覧なしの要約'; }
+claude() { cat > "$test_tmp/prompt"; jq -cn --args '$ARGS.positional' -- "$@" >> "$test_tmp/claude-calls"; echo '一覧なしの要約'; }
 build_daily_report 2026-10-09 > "$test_tmp/no-lists"
 contains "$(daily_path 2026-10-09)" '一覧なしの要約'
 
@@ -215,6 +294,17 @@ absent "$test_tmp/prompt" '対象外の月報'
 absent "$test_tmp/prompt" '別の月の日報'
 absent "$test_tmp/prompt" '入れ子の日報'
 equal "$(wc -l < "$test_tmp/gh-calls" | tr -d ' ')" 1
+tail -1 "$test_tmp/claude-calls" | jq -e 'index("--tools") as $i | .[$i+1] == "" and index("--strict-mcp-config") != null' > /dev/null || fail '月報でツールが禁止されていません'
+
+# 月報生成が失敗しても、既存の月報を上書きしない。
+cp "$REPORT_DIR/202610.md" "$test_tmp/monthly-before"
+(
+    CLAUDE_MAX_ATTEMPTS=1
+    claude() { cat >/dev/null; echo '月報エラー' >&2; return 7; }
+    if (build_monthly_report 2026-10) > /dev/null 2> "$test_tmp/monthly-error"; then fail '月報の失敗を成功扱いしました'; fi
+)
+cmp "$REPORT_DIR/202610.md" "$test_tmp/monthly-before" || fail '失敗時に月報が上書きされました'
+contains "$test_tmp/monthly-error" '月報エラー'
 
 # 再試行の待機時間と、失敗出力が成功結果に混ざらないことを確認する。
 printf '試験プロンプト\n' > "$test_tmp/retry-prompt"
@@ -250,4 +340,5 @@ build_daily_report() { if [[ "$1" == 2026-10-09 ]]; then return 1; fi; echo "$1"
 if (main -j 2 2026-10-08 2026-10-09) > "$test_tmp/parallel-failure"; then fail '並列処理の失敗を成功扱いしました'; fi
 contains "$test_tmp/parallel-failure" '成功: 1, 失敗: 1'
 
-printf 'PASS: 日報・月報・収集・補足・一覧・リトライの検証に成功しました\n'
+python3 "$SCRIPT_DIR/tests/cli.py"
+printf 'PASS: 日報・月報・収集・補足・一覧・連携・リトライの検証に成功しました\n'
